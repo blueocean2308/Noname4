@@ -1,7 +1,8 @@
 """
-Dexter.pw Nuvio addon — Docker-ready
-Stream: GET https://dexter.pw/api/s/1/movie/{tmdbId} → HLS master (4K/1080/…)
-No Turnstile on /api/s path. Playlist URLs stay on dexter.pw (no video through VPS).
+Dexter.pw Nuvio addon v1.1.0
+- Movie + Series
+- Lấy HLS từ meta.sources (kind=hls), không hardcode site id
+- URL playlist/segment trỏ thẳng dexter.pw (không stream video qua container)
 """
 from __future__ import annotations
 
@@ -10,14 +11,12 @@ import re
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-VERSION = "1.0.0"
-PORT = int(os.getenv("PORT", "51825"))
+VERSION = "1.1.0"
 DEXTER = os.getenv("DEXTER_BASE", "https://dexter.pw").rstrip("/")
-SITE_ID = os.getenv("DEXTER_SITE", "1")
 TMDB_KEY = os.getenv("TMDB_API_KEY", "1adf1a2b5aece0ac5106302d3299f56f")
 MIN_HEIGHT = int(os.getenv("MIN_HEIGHT", "1080"))
 UA = (
@@ -27,7 +26,7 @@ UA = (
 HEADERS = {
     "User-Agent": UA,
     "Referer": f"{DEXTER}/",
-    "Accept": "*/*",
+    "Accept": "application/json, text/plain, */*",
 }
 
 app = FastAPI(title="Dexter Addon")
@@ -42,10 +41,10 @@ MANIFEST = {
     "id": "org.nuvio.dexter.pw",
     "version": VERSION,
     "name": "Dexter",
-    "description": "dexter.pw · HLS ≥1080p / 4K (movies)",
+    "description": "dexter.pw · HLS ≥1080p / 4K · movie + series",
     "logo": "https://dexter.pw/favicon.svg",
     "resources": ["stream"],
-    "types": ["movie"],
+    "types": ["movie", "series"],
     "idPrefixes": ["tt", "tmdb"],
     "catalogs": [],
 }
@@ -53,9 +52,7 @@ MANIFEST = {
 
 def cors_json(data: Any, status: int = 200) -> JSONResponse:
     return JSONResponse(
-        data,
-        status_code=status,
-        headers={"Access-Control-Allow-Origin": "*"},
+        data, status_code=status, headers={"Access-Control-Allow-Origin": "*"}
     )
 
 
@@ -70,51 +67,95 @@ async def health():
     return cors_json({"ok": True, "version": VERSION})
 
 
-async def tmdb_from_imdb(imdb_id: str) -> int | None:
-    """tt1234567 → tmdb movie id"""
+async def http_get(url: str, accept: str | None = None) -> tuple[int, str]:
+    h = dict(HEADERS)
+    if accept:
+        h["Accept"] = accept
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        r = await client.get(url, headers=h)
+        return r.status_code, r.text
+
+
+async def tmdb_find(imdb_id: str, want: str) -> int | None:
+    """want: movie | tv"""
     url = (
         f"https://api.themoviedb.org/3/find/{imdb_id}"
         f"?api_key={TMDB_KEY}&external_source=imdb_id"
     )
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            r = await client.get(url)
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            results = data.get("movie_results") or []
-            if results:
-                return int(results[0]["id"])
+        code, text = await http_get(url)
+        if code != 200:
+            return None
+        import json
+
+        data = json.loads(text)
+        key = "movie_results" if want == "movie" else "tv_results"
+        results = data.get(key) or []
+        if results:
+            return int(results[0]["id"])
     except Exception:
         return None
     return None
 
 
-def parse_id(raw: str) -> tuple[str, str | None, int | None]:
-    """
-    Returns (kind, imdb_or_none, tmdb_or_none)
-    kind: movie
-    """
+def parse_movie_id(raw: str) -> tuple[str | None, int | None]:
     raw = raw.replace(".json", "").strip()
     if raw.startswith("tmdb:"):
         try:
-            return "movie", None, int(raw.split(":", 1)[1])
+            return None, int(raw.split(":", 1)[1])
         except ValueError:
-            return "movie", None, None
+            return None, None
     if raw.startswith("tt"):
-        return "movie", raw.split(":")[0] if ":" in raw else raw, None
-    # bare number → tmdb
+        return (raw.split(":")[0] if ":" in raw else raw), None
     if raw.isdigit():
-        return "movie", None, int(raw)
-    return "movie", None, None
+        return None, int(raw)
+    return None, None
+
+
+def parse_series_id(raw: str) -> tuple[str | None, int | None, int, int]:
+    """
+    tt123:1:2 | tmdb:1405:1:2 | 1405:1:2
+    → imdb, tmdb, season, episode
+    """
+    raw = raw.replace(".json", "").strip()
+    parts = raw.split(":")
+    season, episode = 1, 1
+    imdb, tmdb = None, None
+
+    if parts[0] == "tmdb" and len(parts) >= 2:
+        try:
+            tmdb = int(parts[1])
+        except ValueError:
+            tmdb = None
+        if len(parts) >= 4:
+            season, episode = int(parts[2]), int(parts[3])
+        elif len(parts) == 3:
+            season, episode = int(parts[2]), 1
+    elif parts[0].startswith("tt"):
+        imdb = parts[0]
+        if len(parts) >= 3:
+            season, episode = int(parts[1]), int(parts[2])
+    elif parts[0].isdigit():
+        tmdb = int(parts[0])
+        if len(parts) >= 3:
+            season, episode = int(parts[1]), int(parts[2])
+    return imdb, tmdb, season, episode
 
 
 _STREAM_INF = re.compile(
-    r"#EXT-X-STREAM-INF:([^\n]+)\n(/api/v/[^\s\n]+)",
+    r"#EXT-X-STREAM-INF:([^\n]+)\n([^\s\n]+)",
     re.MULTILINE,
 )
 _RES = re.compile(r"RESOLUTION=(\d+)x(\d+)", re.I)
 _BW = re.compile(r"BANDWIDTH=(\d+)", re.I)
+
+
+def abs_url(path: str) -> str:
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{DEXTER}{path}"
 
 
 def parse_master(m3u8: str) -> list[dict]:
@@ -132,8 +173,7 @@ def parse_master(m3u8: str) -> list[dict]:
                 "width": w,
                 "height": h,
                 "bandwidth": bw,
-                "path": path,
-                "url": f"{DEXTER}{path}" if path.startswith("/") else path,
+                "url": abs_url(path),
             }
         )
     out.sort(key=lambda x: (x["height"], x["bandwidth"]), reverse=True)
@@ -152,78 +192,121 @@ def quality_label(h: int) -> str:
     return f"{h}p"
 
 
-async def fetch_master(tmdb_id: int) -> str | None:
-    url = f"{DEXTER}/api/s/{SITE_ID}/movie/{tmdb_id}"
+async def meta_sources_movie(tmdb_id: int) -> list[str]:
+    import json
+
+    code, text = await http_get(f"{DEXTER}/api/movie/{tmdb_id}?site=1")
+    if code != 200:
+        return []
     try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            r = await client.get(url, headers=HEADERS)
-            if r.status_code != 200:
-                return None
-            text = r.text.strip()
-            if not text.startswith("#EXTM3U"):
-                return None
-            return text
+        data = json.loads(text)
     except Exception:
-        return None
+        return []
+    urls = []
+    for s in data.get("sources") or []:
+        if s.get("kind") == "hls" and s.get("url"):
+            urls.append(abs_url(s["url"]))
+    return urls
+
+
+async def meta_sources_episode(tmdb_id: int, season: int, episode: int) -> list[str]:
+    import json
+
+    code, text = await http_get(
+        f"{DEXTER}/api/tv/{tmdb_id}/episode/{season}/{episode}?site=1"
+    )
+    if code != 200:
+        return []
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    urls = []
+    for s in data.get("sources") or []:
+        if s.get("kind") == "hls" and s.get("url"):
+            urls.append(abs_url(s["url"]))
+    return urls
+
+
+async def masters_to_streams(
+    master_urls: list[str], binge: str, ep_label: str = ""
+) -> list[dict]:
+    streams: list[dict] = []
+    seen: set[str] = set()
+    for mu in master_urls:
+        code, body = await http_get(mu, accept="application/vnd.apple.mpegurl,*/*")
+        if code != 200 or not body.strip().startswith("#EXTM3U"):
+            continue
+        variants = [v for v in parse_master(body) if v["height"] >= MIN_HEIGHT]
+        if not variants:
+            variants = parse_master(body)[:1]
+        for v in variants:
+            if v["url"] in seen:
+                continue
+            seen.add(v["url"])
+            q = quality_label(v["height"])
+            title_lines = [f"{q} · {v['width']}x{v['height']}"]
+            if ep_label:
+                title_lines.insert(0, ep_label)
+            title_lines.append("Dexter · HLS")
+            streams.append(
+                {
+                    "name": f"Dexter {q}",
+                    "title": "\n".join(title_lines),
+                    "url": v["url"],
+                    "behaviorHints": {
+                        "notWebReady": True,
+                        "bingeGroup": binge,
+                        "proxyHeaders": {
+                            "request": {
+                                "Referer": f"{DEXTER}/",
+                                "User-Agent": UA,
+                                "Origin": DEXTER,
+                            }
+                        },
+                    },
+                }
+            )
+    return streams
 
 
 @app.get("/stream/movie/{id_raw}")
 async def stream_movie(id_raw: str):
-    _, imdb, tmdb = parse_id(id_raw)
+    imdb, tmdb = parse_movie_id(id_raw)
     if tmdb is None and imdb:
-        tmdb = await tmdb_from_imdb(imdb)
+        tmdb = await tmdb_find(imdb, "movie")
     if not tmdb:
         return cors_json({"streams": []})
 
-    master = await fetch_master(tmdb)
-    if not master:
-        return cors_json({"streams": []})
-
-    variants = [v for v in parse_master(master) if v["height"] >= MIN_HEIGHT]
-    if not variants:
-        # fallback: keep highest available even if < MIN
-        variants = parse_master(master)[:1]
-
-    streams = []
-    for v in variants:
-        q = quality_label(v["height"])
-        title = f"{q} · {v['width']}x{v['height']}\nDexter · HLS"
-        streams.append(
-            {
-                "name": f"Dexter {q}",
-                "title": title,
-                "url": v["url"],
-                "behaviorHints": {
-                    "notWebReady": True,
-                    "bingeGroup": f"dexter-{tmdb}",
-                    "proxyHeaders": {
-                        "request": {
-                            "Referer": f"{DEXTER}/",
-                            "User-Agent": UA,
-                            "Origin": DEXTER,
-                        }
-                    },
-                },
-            }
-        )
+    masters = await meta_sources_movie(tmdb)
+    if not masters:
+        # fallback site paths hay gặp
+        masters = [
+            f"{DEXTER}/api/s/1/movie/{tmdb}",
+            f"{DEXTER}/api/s/21/movie/{tmdb}?v=3",
+        ]
+    streams = await masters_to_streams(masters, binge=f"dexter-movie-{tmdb}")
     return cors_json({"streams": streams})
 
 
 @app.get("/stream/series/{id_raw}")
 async def stream_series(id_raw: str):
-    # Site kho series hạn chế — trả rỗng để khỏi spam lỗi
-    return cors_json({"streams": []})
+    imdb, tmdb, season, episode = parse_series_id(id_raw)
+    if tmdb is None and imdb:
+        tmdb = await tmdb_find(imdb, "tv")
+    if not tmdb:
+        return cors_json({"streams": []})
 
-
-@app.api_route("/{path:path}", methods=["GET", "OPTIONS"])
-async def fallback(path: str, request: Request):
-    if request.method == "OPTIONS":
-        return Response(
-            status_code=204,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-            },
-        )
-    return cors_json({"error": "not found"}, 404)
+    masters = await meta_sources_episode(tmdb, season, episode)
+    if not masters:
+        masters = [
+            f"{DEXTER}/api/s/20/tv/{tmdb}/{season}/{episode}",
+            f"{DEXTER}/api/s/1/tv/{tmdb}/{season}/{episode}",
+        ]
+    ep_label = f"Tập {episode}" if episode else ""
+    streams = await masters_to_streams(
+        masters,
+        binge=f"dexter-tv-{tmdb}-s{season}",
+        ep_label=ep_label,
+    )
+    return cors_json({"streams": streams})
